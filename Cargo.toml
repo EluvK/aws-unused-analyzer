@@ -1,0 +1,19 @@
+[package]
+name = "aws-unused-analyzer"
+version = "0.0.1"
+edition = "2021"
+description = "Free Version of AWS Unused Access Analyzer"
+authors = ["eluvk.dev@gmail.com"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.82"
+aws-config = { version = "1.2.1", features = ["behavior-version-latest"] }
+aws-credential-types = "1.2.0"
+aws-sdk-iam = "1.21.0"
+clap = { version = "4.5.4", features = ["derive"] }
+tokio = { version = "1.37.0", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+aws-sdk-accessanalyzer = "1.23.0"
