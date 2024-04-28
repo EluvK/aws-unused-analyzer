@@ -8,6 +8,7 @@ use aws_config::{
 };
 use aws_credential_types::provider::{error::CredentialsError, ProvideCredentials};
 use aws_sdk_iam::config::SharedCredentialsProvider;
+use aws_unused_analyzer::MetaData;
 use clap::Parser;
 
 #[derive(Debug, Parser, Clone)]
@@ -20,18 +21,15 @@ struct Args {
 
     #[clap(short, long)]
     secret_key: Option<String>,
+
+    #[arg(short, long, default_value = "90")]
+    unused_access_age: i64,
 }
 
 impl Args {
     fn cred(&self) -> anyhow::Result<(String, String)> {
-        let ak = self
-            .access_key
-            .clone()
-            .ok_or(anyhow::anyhow!("access key not found"))?;
-        let sk = self
-            .secret_key
-            .clone()
-            .ok_or(anyhow::anyhow!("secret key not found"))?;
+        let ak = self.access_key.clone().ok_or(anyhow::anyhow!("access key not found"))?;
+        let sk = self.secret_key.clone().ok_or(anyhow::anyhow!("secret key not found"))?;
         Ok((ak, sk))
     }
 }
@@ -43,17 +41,13 @@ impl ProvideRegion for Args {
 }
 
 impl ProvideCredentials for Args {
-    fn provide_credentials<'a>(
-        &'a self,
-    ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
+    fn provide_credentials<'a>(&'a self) -> aws_credential_types::provider::future::ProvideCredentials<'a>
     where
         Self: 'a,
     {
         let cred = self
             .cred()
-            .map_err(|_e| {
-                CredentialsError::not_loaded("no providers in chain provided credentials")
-            })
+            .map_err(|_e| CredentialsError::not_loaded("no providers in chain provided credentials"))
             .map(|(ak, sk)| aws_credential_types::Credentials::new(ak, sk, None, None, "Args"));
         aws_credential_types::provider::future::ProvideCredentials::ready(cred)
     }
@@ -69,8 +63,7 @@ async fn main() -> anyhow::Result<()> {
         let cred_provider = CredentialsProviderChain::first_try("Args", args.clone())
             .or_else("env", EnvironmentVariableCredentialsProvider::default());
 
-        let cred_provider =
-            SharedCredentialsProvider::new(cred_provider.provide_credentials().await?);
+        let cred_provider = SharedCredentialsProvider::new(cred_provider.provide_credentials().await?);
 
         let config = aws_config::SdkConfig::builder()
             .region(region_provider.region().await)
@@ -79,22 +72,25 @@ async fn main() -> anyhow::Result<()> {
             .behavior_version(BehaviorVersion::latest())
             .build();
 
-        if let Err(e) = config
-            .credentials_provider()
-            .unwrap()
-            .provide_credentials()
-            .await
-        {
+        if let Err(e) = config.credentials_provider().unwrap().provide_credentials().await {
             panic!("failed to load credentials: {:?}", e);
         }
         config
     };
-    let iam_config = aws_sdk_iam::config::Builder::from(&sdk_config).build();
 
-    let iam_client = aws_sdk_iam::Client::from_conf(iam_config);
+    let iam_client = aws_sdk_iam::Client::from_conf(aws_sdk_iam::config::Builder::from(&sdk_config).build());
 
-    let resp = iam_client.list_users().send().await;
-    println!("{:#?}", resp);
+    let sts_client = aws_sdk_sts::Client::from_conf(aws_sdk_sts::config::Builder::from(&sdk_config).build());
 
+    let owner_account = sts_client.get_caller_identity().send().await?.account.unwrap();
+    let metadata = MetaData {
+        unused_access_age: args.unused_access_age,
+        owner_account,
+    };
+    let resp = metadata.analyze(&iam_client).await?;
+    // println!("{:#?}", resp);
+    // println!("{:#?}", serde_json::to_string_pretty(&resp));
+    // write resp to file:
+    std::fs::write("unused_findings.json", serde_json::to_string_pretty(&resp)?)?;
     Ok(())
 }
