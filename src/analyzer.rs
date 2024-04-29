@@ -6,7 +6,7 @@ use time::{Duration, OffsetDateTime};
 
 use aws_sdk_iam::{
     primitives::DateTime,
-    types::{Role, ServiceLastAccessed, User},
+    types::{AccessAdvisorUsageGranularityType, Role, ServiceLastAccessed, User},
     Client,
 };
 
@@ -68,12 +68,15 @@ impl MetaData {
             roles
         };
         for role in roles {
+            if role.path().starts_with("/aws-service-role/") {
+                continue; // ignore service role
+            }
             if OffsetDateTime::from_unix_timestamp(role.create_date.secs())
                 .is_ok_and(|created| now - created < Duration::days(self.unused_access_age))
             {
                 continue;
             }
-            result.append(&mut self.analyze_role(iam_client, role).await?);
+            result.append(&mut self.analyze_role(iam_client, role.role_name()).await?);
         }
 
         Ok(result)
@@ -109,6 +112,8 @@ impl MetaData {
 
         let access_keys =
             { iam_client.list_access_keys().user_name(&user.user_name).send().await? }.access_key_metadata;
+
+        let mut unused_access_key_details = vec![];
         for access_key in access_keys {
             if access_key.create_date.is_some_and(|created| {
                 OffsetDateTime::from_unix_timestamp(created.secs())
@@ -120,29 +125,30 @@ impl MetaData {
                         .access_key_id(&access_key_id)
                         .send()
                         .await?;
-                    if let Some(detail) = check_last_accessed_detail(
-                        &now,
-                        self.unused_access_age,
-                        last_access
-                            .access_key_last_used
-                            .map(|last_access| last_access.last_used_date),
-                    ) {
-                        result.push(Finding {
-                            resource: user.arn.clone(),
-                            resource_type: ResourceType::AwsIamUser,
-                            resource_owner_account: self.owner_account.clone(),
-                            id: uuid::Uuid::new_v4().to_string(),
-                            finding_details: vec![FindingDetails::UnusedIamUserAccessKeyDetails(
-                                UnusedIamUserAccessKeyDetails {
-                                    last_accessed: detail,
-                                    access_key_id,
-                                },
-                            )],
-                            finding_type: FindingType::UnusedIamUserAccessKey,
-                        })
+                    // aws last_access use Some(UNIX_EPOCH) as None..., map it back
+                    let last_access = last_access.access_key_last_used.and_then(|last_access| {
+                        (last_access.last_used_date.secs() != 0).then_some(last_access.last_used_date)
+                    });
+                    if let Some(detail) = check_last_accessed_detail(&now, self.unused_access_age, last_access) {
+                        unused_access_key_details.push(FindingDetails::UnusedIamUserAccessKeyDetails(
+                            UnusedIamUserAccessKeyDetails {
+                                last_accessed: detail,
+                                access_key_id,
+                            },
+                        ));
                     }
                 }
             }
+        }
+        if !unused_access_key_details.is_empty() {
+            result.push(Finding {
+                resource: user.arn.clone(),
+                resource_type: ResourceType::AwsIamUser,
+                resource_owner_account: self.owner_account.clone(),
+                id: uuid::Uuid::new_v4().to_string(),
+                finding_details: unused_access_key_details,
+                finding_type: FindingType::UnusedIamUserAccessKey,
+            })
         }
 
         let unused_permission_details: Vec<_> = self
@@ -172,9 +178,17 @@ impl MetaData {
         Ok(result)
     }
 
-    async fn analyze_role(&self, iam_client: &Client, role: Role) -> anyhow::Result<Vec<Finding>> {
+    async fn analyze_role(&self, iam_client: &Client, role_name: &str) -> anyhow::Result<Vec<Finding>> {
         let now = OffsetDateTime::now_utc();
         let mut result = vec![];
+
+        let role = iam_client
+            .get_role()
+            .role_name(role_name)
+            .send()
+            .await?
+            .role
+            .ok_or(anyhow::anyhow!("role not found"))?;
 
         if let Some(detail) = check_last_accessed_detail(
             &now,
@@ -225,6 +239,7 @@ impl MetaData {
         let job_id = iam_client
             .generate_service_last_accessed_details()
             .arn(arn)
+            .granularity(AccessAdvisorUsageGranularityType::ActionLevel)
             .send()
             .await?
             .job_id
@@ -262,6 +277,6 @@ fn check_last_accessed_detail(
     }) {
         None
     } else {
-        Some(last_used_at.map(Into::into))
+        Some(last_used_at)
     }
 }
