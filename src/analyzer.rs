@@ -1,18 +1,13 @@
-#![allow(unused)]
-#![allow(unused_variables)]
-
-use std::alloc::System;
-use time::{Duration, OffsetDateTime};
+use time::OffsetDateTime;
 
 use aws_sdk_iam::{
-    primitives::DateTime,
-    types::{AccessAdvisorUsageGranularityType, Role, ServiceLastAccessed, User},
+    types::{AccessAdvisorUsageGranularityType, ServiceLastAccessed, User},
     Client,
 };
 
 use crate::finding::{
-    Finding, FindingDetails, FindingType, ResourceType, UnusedIamRoleDetails, UnusedIamUserAccessKeyDetails,
-    UnusedIamUserPasswordDetails, UnusedPermissionDetails,
+    duration_gt_age, Finding, FindingDetails, FindingType, ResourceType, UnusedIamRoleDetails,
+    UnusedIamUserAccessKeyDetails, UnusedIamUserPasswordDetails, UnusedPermissionDetails,
 };
 
 pub struct MetaData {
@@ -45,12 +40,9 @@ impl MetaData {
         };
 
         for user in users {
-            if OffsetDateTime::from_unix_timestamp(user.create_date.secs())
-                .is_ok_and(|created| now - created < Duration::days(self.unused_access_age))
-            {
-                continue;
+            if duration_gt_age(Some(user.create_date), &now, self.unused_access_age) {
+                result.append(&mut self.analyze_user(iam_client, user).await?);
             }
-            result.append(&mut self.analyze_user(iam_client, user).await?);
         }
 
         let roles = {
@@ -71,12 +63,9 @@ impl MetaData {
             if role.path().starts_with("/aws-service-role/") {
                 continue; // ignore service role
             }
-            if OffsetDateTime::from_unix_timestamp(role.create_date.secs())
-                .is_ok_and(|created| now - created < Duration::days(self.unused_access_age))
-            {
-                continue;
+            if duration_gt_age(Some(role.create_date), &now, self.unused_access_age) {
+                result.append(&mut self.analyze_role(iam_client, role.role_name()).await?);
             }
-            result.append(&mut self.analyze_role(iam_client, role.role_name()).await?);
         }
 
         Ok(result)
@@ -92,11 +81,11 @@ impl MetaData {
                 Err(e) => return Err(e)?,
             }
         };
-        if login_profile.is_some_and(|login_profile| {
-            OffsetDateTime::from_unix_timestamp(login_profile.create_date.secs())
-                .is_ok_and(|created| now - created > Duration::days(self.unused_access_age))
-        }) {
-            if let Some(detail) = check_last_accessed_detail(&now, self.unused_access_age, user.password_last_used) {
+        if login_profile
+            .is_some_and(|login_profile| duration_gt_age(Some(login_profile.create_date), &now, self.unused_access_age))
+        {
+            let last_access = user.password_last_used;
+            if let Some(detail) = duration_gt_age(last_access, &now, self.unused_access_age).then_some(last_access) {
                 result.push(Finding {
                     resource: user.arn.clone(),
                     resource_type: ResourceType::AwsIamUser,
@@ -111,14 +100,11 @@ impl MetaData {
         }
 
         let access_keys =
-            { iam_client.list_access_keys().user_name(&user.user_name).send().await? }.access_key_metadata;
+            { iam_client.list_access_keys().user_name(&user.user_name).send().await }?.access_key_metadata;
 
         let mut unused_access_key_details = vec![];
         for access_key in access_keys {
-            if access_key.create_date.is_some_and(|created| {
-                OffsetDateTime::from_unix_timestamp(created.secs())
-                    .is_ok_and(|created| now - created > Duration::days(self.unused_access_age))
-            }) {
+            if duration_gt_age(access_key.create_date, &now, self.unused_access_age) {
                 if let Some(access_key_id) = access_key.access_key_id {
                     let last_access = iam_client
                         .get_access_key_last_used()
@@ -129,7 +115,9 @@ impl MetaData {
                     let last_access = last_access.access_key_last_used.and_then(|last_access| {
                         (last_access.last_used_date.secs() != 0).then_some(last_access.last_used_date)
                     });
-                    if let Some(detail) = check_last_accessed_detail(&now, self.unused_access_age, last_access) {
+                    if let Some(detail) =
+                        duration_gt_age(last_access, &now, self.unused_access_age).then_some(last_access)
+                    {
                         unused_access_key_details.push(FindingDetails::UnusedIamUserAccessKeyDetails(
                             UnusedIamUserAccessKeyDetails {
                                 last_accessed: detail,
@@ -157,11 +145,9 @@ impl MetaData {
             .into_iter()
             .filter_map(|last_accessed| {
                 let details = Into::<UnusedPermissionDetails>::into(last_accessed);
-                if details.all_used(&now, self.unused_access_age) {
-                    None
-                } else {
-                    Some(FindingDetails::UnusedPermissionDetails(details))
-                }
+                details
+                    .any_not_used(&now, self.unused_access_age)
+                    .then_some(FindingDetails::UnusedPermissionDetails(details))
             })
             .collect();
         if !unused_permission_details.is_empty() {
@@ -182,19 +168,12 @@ impl MetaData {
         let now = OffsetDateTime::now_utc();
         let mut result = vec![];
 
-        let role = iam_client
-            .get_role()
-            .role_name(role_name)
-            .send()
-            .await?
+        let role = { iam_client.get_role().role_name(role_name).send().await }?
             .role
             .ok_or(anyhow::anyhow!("role not found"))?;
 
-        if let Some(detail) = check_last_accessed_detail(
-            &now,
-            self.unused_access_age,
-            role.role_last_used.and_then(|last_used| last_used.last_used_date),
-        ) {
+        let last_access = role.role_last_used.and_then(|last_used| last_used.last_used_date);
+        if let Some(detail) = duration_gt_age(last_access, &now, self.unused_access_age).then_some(last_access) {
             result.push(Finding {
                 resource: role.arn.clone(),
                 resource_type: ResourceType::AwsIamRole,
@@ -213,11 +192,9 @@ impl MetaData {
             .into_iter()
             .filter_map(|last_accessed| {
                 let details = Into::<UnusedPermissionDetails>::into(last_accessed);
-                if details.all_used(&now, self.unused_access_age) {
-                    None
-                } else {
-                    Some(FindingDetails::UnusedPermissionDetails(details))
-                }
+                details
+                    .any_not_used(&now, self.unused_access_age)
+                    .then_some(FindingDetails::UnusedPermissionDetails(details))
             })
             .collect();
         if !unused_permission_details.is_empty() {
@@ -235,15 +212,16 @@ impl MetaData {
     }
 
     async fn get_last_accessed(&self, iam_client: &Client, arn: &str) -> anyhow::Result<Vec<ServiceLastAccessed>> {
-        let now = OffsetDateTime::now_utc();
-        let job_id = iam_client
-            .generate_service_last_accessed_details()
-            .arn(arn)
-            .granularity(AccessAdvisorUsageGranularityType::ActionLevel)
-            .send()
-            .await?
-            .job_id
-            .ok_or(anyhow::anyhow!("without job id while get last accessed details"))?;
+        let job_id = {
+            iam_client
+                .generate_service_last_accessed_details()
+                .arn(arn)
+                .granularity(AccessAdvisorUsageGranularityType::ActionLevel)
+                .send()
+                .await
+        }?
+        .job_id
+        .ok_or(anyhow::anyhow!("without job id while get last accessed details"))?;
         for _ in 0..10 {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             let report = iam_client
@@ -257,26 +235,10 @@ impl MetaData {
                 }
                 aws_sdk_iam::types::JobStatusType::InProgress => {}
                 status => {
-                    anyhow::anyhow!("job status invalid?");
+                    anyhow::bail!("job status invalid: status:{status}");
                 }
             }
         }
-        Err(anyhow::anyhow!("timeout"))?
-    }
-}
-
-type LastAccessedDetail = Option<DateTime>;
-fn check_last_accessed_detail(
-    analyzed_at: &OffsetDateTime,
-    unused_access_age: i64,
-    last_used_at: Option<DateTime>,
-) -> Option<LastAccessedDetail> {
-    if last_used_at.is_some_and(|last_used_at| {
-        OffsetDateTime::from_unix_timestamp(last_used_at.secs())
-            .is_ok_and(|last_used_at| *analyzed_at - last_used_at < Duration::days(unused_access_age))
-    }) {
-        None
-    } else {
-        Some(last_used_at)
+        anyhow::bail!("timeout");
     }
 }

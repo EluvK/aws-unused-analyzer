@@ -22,6 +22,7 @@ pub enum ResourceType {
 }
 
 #[derive(Serialize, Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum FindingType {
     UnusedIamRole,
     UnusedIamUserAccessKey,
@@ -30,6 +31,7 @@ pub enum FindingType {
 }
 
 #[derive(Serialize, Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum FindingDetails {
     UnusedIamRoleDetails(UnusedIamRoleDetails),
     UnusedIamUserAccessKeyDetails(UnusedIamUserAccessKeyDetails),
@@ -93,18 +95,21 @@ impl From<ServiceLastAccessed> for UnusedPermissionDetails {
 }
 
 impl UnusedPermissionDetails {
-    pub fn all_used(&self, analyzed_at: &OffsetDateTime, unused_access_age: i64) -> bool {
-        self.last_accessed.is_some_and(|last_accessed| {
-            OffsetDateTime::from_unix_timestamp(last_accessed.secs())
-                .is_ok_and(|last_accessed| *analyzed_at - last_accessed < Duration::days(unused_access_age))
-        }) && self.actions.as_ref().is_some_and(|actions| {
-            actions.iter().all(|action| {
-                action.last_accessed.is_some_and(|last_accessed| {
-                    OffsetDateTime::from_unix_timestamp(last_accessed.secs())
-                        .is_ok_and(|last_accessed| *analyzed_at - last_accessed < Duration::days(unused_access_age))
-                })
+    pub fn any_not_used(&self, analyzed_at: &OffsetDateTime, unused_access_age: i64) -> bool {
+        duration_gt_age(self.last_accessed, analyzed_at, unused_access_age)
+            || self.actions.as_ref().is_some_and(|actions| {
+                actions
+                    .iter()
+                    .any(|action| duration_gt_age(action.last_accessed, analyzed_at, unused_access_age))
             })
-        })
+    }
+}
+
+pub fn duration_gt_age(last_accessed: Option<DateTime>, analyzed_at: &OffsetDateTime, unused_access_age: i64) -> bool {
+    match last_accessed {
+        None => true,
+        Some(last_accessed) => OffsetDateTime::from_unix_timestamp(last_accessed.secs())
+            .is_ok_and(|last_accessed| *analyzed_at - last_accessed > Duration::days(unused_access_age)),
     }
 }
 
