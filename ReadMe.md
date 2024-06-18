@@ -71,6 +71,7 @@ Wait for a while(depends on the number of IAM Users and Roles), you will get the
 ## Roadmap
 
 - [x] Implement the account unused analyzer generating same output as the official one.
+- [ ] Implement the finding recommendation for UnusedPermission of Role. (updated at 6.18 re:Inforce 2024)
 - [ ] Implement the organization unused analyzer feature (using user defined role maybe).
 - [ ] ...to be finded out.
 
